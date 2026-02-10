@@ -53,10 +53,27 @@ python3 run_gui.py
 - Jede neue GUI-Session erstellt automatisch einen neuen Unterordner pro Algorithmus
 
 ### Verfügbare Algorithmen (Stand jetzt):
-1. **Canny (Auto)** — Auto-Threshold Canny-Edge-Detection
-2. **Canny + Contour Silhouette** — Canny + morphologisches Closing + größter Contour
-3. **CLAHE + Canny** — Kontrast-Enhancement + Canny
-4. **Canny + Hough Lines** — Canny + Probabilistic Hough Transform für Linien-Detektion
+1. **Canny (Auto)** — Auto-Threshold Canny-Edge-Detection ⭐ **Robust**
+2. **CLAHE + Canny** — Kontrast-Enhancement + Canny ⭐ **Robust**
+3. **Canny (Manual)** — Manuelle Threshold-Kontrolle via Slider
+4. **Sobel Magnitude** — Sobel-Gradienten-basierte Edge-Detection
+5. **Laplacian of Gaussian** — LoG für feine Kanten
+6. **Multi-scale Canny** — Canny auf mehreren Skalen kombiniert
+7. **Canny + Contour Silhouette** — Silhouetten-Extraktion via Contour
+8. **Canny + Hough Lines** — Linien-Detektion für Flügel/Kanten
+
+### Parameter-Anpassung:
+Die GUI bietet Live-Slider für:
+- **Canny Low/High Thresholds** (10-300)
+- **Gaussian σ** (0.1-5.0) — Blur vor Edge-Detection
+- **CLAHE Clip Limit** (1.0-10.0) — Kontrast-Enhancement
+- **BBox Padding** (0-20 px) — Reduziert BBox-Kanten-Artefakte
+
+### GUI-Features:
+- ✅ **Zoom-Erhaltung**: Zoom bleibt beim Algorithmus-Wechsel erhalten
+- ✅ **BBox-Padding**: Vermeidet falsche Edge-Detection an BBox-Kanten
+- ✅ **Echtzeit-Parameter**: Slider für sofortige Anpassungen
+- ✅ **Session-Management**: Automatische Versionierung der Outputs
 
 ## Output-Struktur
 

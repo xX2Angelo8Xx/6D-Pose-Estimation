@@ -34,6 +34,9 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsPixmapItem,
     QMessageBox,
+    QSlider,
+    QGroupBox,
+    QFormLayout,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QImage, QWheelEvent
@@ -56,15 +59,33 @@ class ZoomableGraphicsView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.zoom_factor = 1.15
+        self._zoom_level = 1.0
         
     def wheelEvent(self, event: QWheelEvent):
         """Zoom in/out on mouse wheel."""
         if event.angleDelta().y() > 0:
             # Zoom in
             self.scale(self.zoom_factor, self.zoom_factor)
+            self._zoom_level *= self.zoom_factor
         else:
             # Zoom out
             self.scale(1 / self.zoom_factor, 1 / self.zoom_factor)
+            self._zoom_level /= self.zoom_factor
+    
+    def get_zoom_level(self) -> float:
+        """Return current zoom level."""
+        return self._zoom_level
+    
+    def reset_zoom(self):
+        """Reset zoom to 1.0."""
+        self.resetTransform()
+        self._zoom_level = 1.0
+    
+    def set_zoom_level(self, level: float):
+        """Set zoom to specific level."""
+        self.resetTransform()
+        self.scale(level, level)
+        self._zoom_level = level
 
 
 class EdgeDetectionGUI(QMainWindow):
@@ -94,11 +115,26 @@ class EdgeDetectionGUI(QMainWindow):
         self.current_bbox: Optional[Tuple[int, int, int, int]] = None
         self.last_runtime_ms: float = 0.0
         
+        # Algorithm parameters
+        self.params = {
+            'canny_low': 50,
+            'canny_high': 150,
+            'canny_auto': True,
+            'gaussian_sigma': 1.0,
+            'clahe_clip': 2.0,
+            'bbox_padding': 5,  # Padding to avoid bbox edge artifacts
+            'morph_kernel': 5,
+        }
+        
         # Available algorithms
         self.algorithms = {
             "Canny (Auto)": self.apply_canny_auto,
-            "Canny + Contour Silhouette": self.apply_canny_contour,
             "CLAHE + Canny": self.apply_clahe_canny,
+            "Canny (Manual)": self.apply_canny_manual,
+            "Sobel Magnitude": self.apply_sobel,
+            "Laplacian of Gaussian": self.apply_log,
+            "Multi-scale Canny": self.apply_multiscale_canny,
+            "Canny + Contour Silhouette": self.apply_canny_contour,
             "Canny + Hough Lines": self.apply_canny_hough,
         }
         
@@ -154,6 +190,72 @@ class EdgeDetectionGUI(QMainWindow):
         
         main_layout.addLayout(algo_layout)
         
+        # Parameter panel
+        param_group = QGroupBox("Algorithm Parameters")
+        param_layout = QHBoxLayout()
+        
+        # Canny thresholds
+        canny_layout = QVBoxLayout()
+        canny_layout.addWidget(QLabel("Canny Low:"))
+        self.slider_canny_low = QSlider(Qt.Orientation.Horizontal)
+        self.slider_canny_low.setRange(10, 200)
+        self.slider_canny_low.setValue(self.params['canny_low'])
+        self.slider_canny_low.valueChanged.connect(lambda v: self.update_param('canny_low', v))
+        self.lbl_canny_low = QLabel(str(self.params['canny_low']))
+        canny_layout.addWidget(self.slider_canny_low)
+        canny_layout.addWidget(self.lbl_canny_low)
+        param_layout.addLayout(canny_layout)
+        
+        canny_high_layout = QVBoxLayout()
+        canny_high_layout.addWidget(QLabel("Canny High:"))
+        self.slider_canny_high = QSlider(Qt.Orientation.Horizontal)
+        self.slider_canny_high.setRange(50, 300)
+        self.slider_canny_high.setValue(self.params['canny_high'])
+        self.slider_canny_high.valueChanged.connect(lambda v: self.update_param('canny_high', v))
+        self.lbl_canny_high = QLabel(str(self.params['canny_high']))
+        canny_high_layout.addWidget(self.slider_canny_high)
+        canny_high_layout.addWidget(self.lbl_canny_high)
+        param_layout.addLayout(canny_high_layout)
+        
+        # Gaussian sigma
+        sigma_layout = QVBoxLayout()
+        sigma_layout.addWidget(QLabel("Gaussian σ:"))
+        self.slider_sigma = QSlider(Qt.Orientation.Horizontal)
+        self.slider_sigma.setRange(1, 50)
+        self.slider_sigma.setValue(int(self.params['gaussian_sigma'] * 10))
+        self.slider_sigma.valueChanged.connect(lambda v: self.update_param('gaussian_sigma', v / 10.0))
+        self.lbl_sigma = QLabel(f"{self.params['gaussian_sigma']:.1f}")
+        sigma_layout.addWidget(self.slider_sigma)
+        sigma_layout.addWidget(self.lbl_sigma)
+        param_layout.addLayout(sigma_layout)
+        
+        # CLAHE clip limit
+        clahe_layout = QVBoxLayout()
+        clahe_layout.addWidget(QLabel("CLAHE Clip:"))
+        self.slider_clahe = QSlider(Qt.Orientation.Horizontal)
+        self.slider_clahe.setRange(10, 100)
+        self.slider_clahe.setValue(int(self.params['clahe_clip'] * 10))
+        self.slider_clahe.valueChanged.connect(lambda v: self.update_param('clahe_clip', v / 10.0))
+        self.lbl_clahe = QLabel(f"{self.params['clahe_clip']:.1f}")
+        clahe_layout.addWidget(self.slider_clahe)
+        clahe_layout.addWidget(self.lbl_clahe)
+        param_layout.addLayout(clahe_layout)
+        
+        # BBox padding
+        padding_layout = QVBoxLayout()
+        padding_layout.addWidget(QLabel("BBox Padding:"))
+        self.slider_padding = QSlider(Qt.Orientation.Horizontal)
+        self.slider_padding.setRange(0, 20)
+        self.slider_padding.setValue(self.params['bbox_padding'])
+        self.slider_padding.valueChanged.connect(lambda v: self.update_param('bbox_padding', v))
+        self.lbl_padding = QLabel(str(self.params['bbox_padding']))
+        padding_layout.addWidget(self.slider_padding)
+        padding_layout.addWidget(self.lbl_padding)
+        param_layout.addLayout(padding_layout)
+        
+        param_group.setLayout(param_layout)
+        main_layout.addWidget(param_group)
+        
         # Image viewer
         self.scene = QGraphicsScene()
         self.view = ZoomableGraphicsView()
@@ -161,6 +263,20 @@ class EdgeDetectionGUI(QMainWindow):
         self.pixmap_item = QGraphicsPixmapItem()
         self.scene.addItem(self.pixmap_item)
         main_layout.addWidget(self.view)
+    
+    def update_param(self, key: str, value):
+        """Update parameter and refresh label."""
+        self.params[key] = value
+        if key == 'canny_low':
+            self.lbl_canny_low.setText(str(value))
+        elif key == 'canny_high':
+            self.lbl_canny_high.setText(str(value))
+        elif key == 'gaussian_sigma':
+            self.lbl_sigma.setText(f"{value:.1f}")
+        elif key == 'clahe_clip':
+            self.lbl_clahe.setText(f"{value:.1f}")
+        elif key == 'bbox_padding':
+            self.lbl_padding.setText(str(value))
         
     def load_or_create_session(self):
         """Load existing sessions or create new session entry."""
@@ -266,7 +382,10 @@ class EdgeDetectionGUI(QMainWindow):
             return None
     
     def display_image(self, img: np.ndarray):
-        """Display image in the viewer."""
+        """Display image in the viewer, preserving zoom level."""
+        # Save current zoom level
+        current_zoom = self.view.get_zoom_level()
+        
         # Draw bounding box if available
         display_img = img.copy()
         if self.current_bbox is not None:
@@ -283,7 +402,12 @@ class EdgeDetectionGUI(QMainWindow):
         pixmap = QPixmap.fromImage(qt_image)
         
         self.pixmap_item.setPixmap(pixmap)
-        self.view.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        
+        # Restore zoom level
+        if current_zoom > 1.01:  # Only restore if significantly zoomed
+            self.view.set_zoom_level(current_zoom)
+        else:
+            self.view.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
     
     def prev_image(self):
         """Load previous image."""
@@ -296,6 +420,36 @@ class EdgeDetectionGUI(QMainWindow):
         if self.image_files and self.current_image_idx < len(self.image_files) - 1:
             self.current_image_idx += 1
             self.load_current_image()
+    
+    def get_roi_with_padding(self) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        """
+        Extract ROI from image with padding to avoid bbox edge artifacts.
+        Returns (roi_image, adjusted_bbox_in_roi)
+        """
+        if self.current_bbox is None or self.current_image is None:
+            return self.current_image, None
+        
+        x1, y1, x2, y2 = self.current_bbox
+        h, w = self.current_image.shape[:2]
+        pad = self.params['bbox_padding']
+        
+        # Apply padding (inward to avoid bbox edges)
+        x1_pad = min(x1 + pad, x2 - 1)
+        y1_pad = min(y1 + pad, y2 - 1)
+        x2_pad = max(x2 - pad, x1 + 1)
+        y2_pad = max(y2 - pad, y1 + 1)
+        
+        # Clamp to image bounds
+        x1_pad = max(0, x1_pad)
+        y1_pad = max(0, y1_pad)
+        x2_pad = min(w, x2_pad)
+        y2_pad = min(h, y2_pad)
+        
+        # Extract ROI
+        roi = self.current_image[y1_pad:y2_pad, x1_pad:x2_pad].copy()
+        
+        # Return ROI and adjusted bbox (in original image coordinates)
+        return roi, (x1_pad, y1_pad, x2_pad, y2_pad)
     
     def apply_algorithm(self):
         """Apply selected algorithm to current image."""
@@ -325,11 +479,10 @@ class EdgeDetectionGUI(QMainWindow):
         self.btn_save.setEnabled(True)
     
     def apply_canny_auto(self) -> np.ndarray:
-        """Apply auto-threshold Canny within bbox."""
-        x1, y1, x2, y2 = self.current_bbox
-        roi = self.current_image[y1:y2, x1:x2]
+        """Apply auto-threshold Canny within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
         
-        edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=1.0)
+        edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=self.params['gaussian_sigma'])
         
         # Overlay on original
         result = self.current_image.copy()
@@ -337,13 +490,106 @@ class EdgeDetectionGUI(QMainWindow):
         
         return result
     
-    def apply_canny_contour(self) -> np.ndarray:
-        """Apply Canny + contour silhouette within bbox."""
-        x1, y1, x2, y2 = self.current_bbox
-        roi = self.current_image[y1:y2, x1:x2]
+    def apply_canny_manual(self) -> np.ndarray:
+        """Apply manual-threshold Canny within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
         
-        edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=1.0)
-        silhouette = extract_silhouette_from_contours(edges, roi.shape, morph_kernel_size=5, min_area_ratio=0.01)
+        edges = canny_edge_detection(
+            roi, 
+            auto_threshold=False, 
+            low_threshold=self.params['canny_low'],
+            high_threshold=self.params['canny_high'],
+            blur_sigma=self.params['gaussian_sigma']
+        )
+        
+        # Overlay on original
+        result = self.current_image.copy()
+        result[y1:y2, x1:x2][edges > 0] = [0, 255, 0]
+        
+        return result
+    
+    def apply_sobel(self) -> np.ndarray:
+        """Apply Sobel magnitude within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur
+        ksize = int(2 * round(3 * self.params['gaussian_sigma']) + 1)
+        blurred = cv2.GaussianBlur(gray, (ksize, ksize), self.params['gaussian_sigma'])
+        
+        # Sobel gradients
+        sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+        magnitude = np.sqrt(sobelx**2 + sobely**2)
+        magnitude = np.uint8(255 * magnitude / magnitude.max())
+        
+        # Threshold
+        _, edges = cv2.threshold(magnitude, 50, 255, cv2.THRESH_BINARY)
+        
+        # Overlay on original
+        result = self.current_image.copy()
+        result[y1:y2, x1:x2][edges > 0] = [255, 0, 255]  # Magenta
+        
+        return result
+    
+    def apply_log(self) -> np.ndarray:
+        """Apply Laplacian of Gaussian within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur
+        ksize = int(2 * round(3 * self.params['gaussian_sigma']) + 1)
+        blurred = cv2.GaussianBlur(gray, (ksize, ksize), self.params['gaussian_sigma'])
+        
+        # Laplacian
+        laplacian = cv2.Laplacian(blurred, cv2.CV_64F, ksize=3)
+        laplacian = np.uint8(np.absolute(laplacian))
+        
+        # Threshold
+        _, edges = cv2.threshold(laplacian, 30, 255, cv2.THRESH_BINARY)
+        
+        # Overlay on original
+        result = self.current_image.copy()
+        result[y1:y2, x1:x2][edges > 0] = [255, 255, 0]  # Yellow
+        
+        return result
+    
+    def apply_multiscale_canny(self) -> np.ndarray:
+        """Apply multi-scale Canny and merge results within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
+        
+        # Multiple scales
+        sigmas = [0.5, 1.0, 2.0]
+        all_edges = []
+        
+        for sigma in sigmas:
+            edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=sigma)
+            all_edges.append(edges)
+        
+        # Combine edges (logical OR)
+        combined = np.zeros_like(all_edges[0])
+        for edges in all_edges:
+            combined = np.logical_or(combined, edges > 0)
+        
+        combined = combined.astype(np.uint8) * 255
+        
+        # Overlay on original
+        result = self.current_image.copy()
+        result[y1:y2, x1:x2][combined > 0] = [0, 128, 255]  # Orange
+        
+        return result
+    
+    def apply_canny_contour(self) -> np.ndarray:
+        """Apply Canny + contour silhouette within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
+        
+        edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=self.params['gaussian_sigma'])
+        silhouette = extract_silhouette_from_contours(
+            edges, 
+            roi.shape, 
+            morph_kernel_size=self.params['morph_kernel'], 
+            min_area_ratio=0.01
+        )
         
         # Overlay silhouette on original
         result = self.current_image.copy()
@@ -354,12 +600,11 @@ class EdgeDetectionGUI(QMainWindow):
         return result
     
     def apply_clahe_canny(self) -> np.ndarray:
-        """Apply CLAHE preprocessing + Canny within bbox."""
-        x1, y1, x2, y2 = self.current_bbox
-        roi = self.current_image[y1:y2, x1:x2]
+        """Apply CLAHE preprocessing + Canny within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
         
-        clahe_roi = apply_clahe(roi, clip_limit=2.0, tile_grid_size=(8, 8))
-        edges = canny_edge_detection(clahe_roi, auto_threshold=True, blur_sigma=1.0)
+        clahe_roi = apply_clahe(roi, clip_limit=self.params['clahe_clip'], tile_grid_size=(8, 8))
+        edges = canny_edge_detection(clahe_roi, auto_threshold=True, blur_sigma=self.params['gaussian_sigma'])
         
         # Overlay on original
         result = self.current_image.copy()
@@ -368,11 +613,10 @@ class EdgeDetectionGUI(QMainWindow):
         return result
     
     def apply_canny_hough(self) -> np.ndarray:
-        """Apply Canny + Hough line detection within bbox."""
-        x1, y1, x2, y2 = self.current_bbox
-        roi = self.current_image[y1:y2, x1:x2]
+        """Apply Canny + Hough line detection within bbox (with padding)."""
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
         
-        edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=1.0)
+        edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=self.params['gaussian_sigma'])
         
         # Detect lines
         roi_h, roi_w = roi.shape[:2]
