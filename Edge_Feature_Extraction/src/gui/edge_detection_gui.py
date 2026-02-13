@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSlider,
     QGroupBox,
-    QFormLayout,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QImage, QWheelEvent
@@ -124,18 +123,56 @@ class EdgeDetectionGUI(QMainWindow):
             'clahe_clip': 2.0,
             'bbox_padding': 5,  # Padding to avoid bbox edge artifacts
             'morph_kernel': 5,
+            'snake_alpha': 0.01,  # Active contour elasticity
+            'snake_beta': 0.1,    # Active contour stiffness
+            'snake_iterations': 100,
         }
         
-        # Available algorithms
+        # Default parameter values (for reset)
+        self.default_params = self.params.copy()
+        
+        # Available algorithms with their used parameters
         self.algorithms = {
-            "Canny (Auto)": self.apply_canny_auto,
-            "CLAHE + Canny": self.apply_clahe_canny,
-            "Canny (Manual)": self.apply_canny_manual,
-            "Sobel Magnitude": self.apply_sobel,
-            "Laplacian of Gaussian": self.apply_log,
-            "Multi-scale Canny": self.apply_multiscale_canny,
-            "Canny + Contour Silhouette": self.apply_canny_contour,
-            "Canny + Hough Lines": self.apply_canny_hough,
+            "Canny (Auto)": {
+                'func': self.apply_canny_auto,
+                'params': ['gaussian_sigma', 'bbox_padding']
+            },
+            "CLAHE + Canny": {
+                'func': self.apply_clahe_canny,
+                'params': ['clahe_clip', 'gaussian_sigma', 'bbox_padding']
+            },
+            "Canny (Manual)": {
+                'func': self.apply_canny_manual,
+                'params': ['canny_low', 'canny_high', 'gaussian_sigma', 'bbox_padding']
+            },
+            "Sobel Magnitude": {
+                'func': self.apply_sobel,
+                'params': ['gaussian_sigma', 'bbox_padding']
+            },
+            "Laplacian of Gaussian": {
+                'func': self.apply_log,
+                'params': ['gaussian_sigma', 'bbox_padding']
+            },
+            "Multi-scale Canny": {
+                'func': self.apply_multiscale_canny,
+                'params': ['bbox_padding']
+            },
+            "Structured Edges": {
+                'func': self.apply_structured_edges,
+                'params': ['bbox_padding']
+            },
+            "Active Contours (Snake)": {
+                'func': self.apply_active_contours,
+                'params': ['gaussian_sigma', 'snake_alpha', 'snake_beta', 'snake_iterations', 'bbox_padding']
+            },
+            "Canny + Contour Silhouette": {
+                'func': self.apply_canny_contour,
+                'params': ['gaussian_sigma', 'morph_kernel', 'bbox_padding']
+            },
+            "Canny + Hough Lines": {
+                'func': self.apply_canny_hough,
+                'params': ['gaussian_sigma', 'bbox_padding']
+            },
         }
         
         self.init_ui()
@@ -172,6 +209,7 @@ class EdgeDetectionGUI(QMainWindow):
         algo_layout.addWidget(QLabel("Algorithm:"))
         self.combo_algorithm = QComboBox()
         self.combo_algorithm.addItems(list(self.algorithms.keys()))
+        self.combo_algorithm.currentTextChanged.connect(self.on_algorithm_changed)
         algo_layout.addWidget(self.combo_algorithm)
         
         self.btn_apply = QPushButton("Apply Algorithm")
@@ -192,68 +230,154 @@ class EdgeDetectionGUI(QMainWindow):
         
         # Parameter panel
         param_group = QGroupBox("Algorithm Parameters")
+        param_main_layout = QVBoxLayout()
         param_layout = QHBoxLayout()
         
-        # Canny thresholds
-        canny_layout = QVBoxLayout()
-        canny_layout.addWidget(QLabel("Canny Low:"))
+        # Store all parameter layouts for enable/disable
+        self.param_widgets = {}
+        
+        # Canny Low threshold
+        self.canny_low_layout = QVBoxLayout()
+        lbl = QLabel("Canny Low:")
+        self.canny_low_layout.addWidget(lbl)
         self.slider_canny_low = QSlider(Qt.Orientation.Horizontal)
         self.slider_canny_low.setRange(10, 200)
         self.slider_canny_low.setValue(self.params['canny_low'])
         self.slider_canny_low.valueChanged.connect(lambda v: self.update_param('canny_low', v))
         self.lbl_canny_low = QLabel(str(self.params['canny_low']))
-        canny_layout.addWidget(self.slider_canny_low)
-        canny_layout.addWidget(self.lbl_canny_low)
-        param_layout.addLayout(canny_layout)
+        self.canny_low_layout.addWidget(self.slider_canny_low)
+        self.canny_low_layout.addWidget(self.lbl_canny_low)
+        param_layout.addLayout(self.canny_low_layout)
+        self.param_widgets['canny_low'] = [lbl, self.slider_canny_low, self.lbl_canny_low]
         
-        canny_high_layout = QVBoxLayout()
-        canny_high_layout.addWidget(QLabel("Canny High:"))
+        # Canny High threshold
+        self.canny_high_layout = QVBoxLayout()
+        lbl = QLabel("Canny High:")
+        self.canny_high_layout.addWidget(lbl)
         self.slider_canny_high = QSlider(Qt.Orientation.Horizontal)
         self.slider_canny_high.setRange(50, 300)
         self.slider_canny_high.setValue(self.params['canny_high'])
         self.slider_canny_high.valueChanged.connect(lambda v: self.update_param('canny_high', v))
         self.lbl_canny_high = QLabel(str(self.params['canny_high']))
-        canny_high_layout.addWidget(self.slider_canny_high)
-        canny_high_layout.addWidget(self.lbl_canny_high)
-        param_layout.addLayout(canny_high_layout)
+        self.canny_high_layout.addWidget(self.slider_canny_high)
+        self.canny_high_layout.addWidget(self.lbl_canny_high)
+        param_layout.addLayout(self.canny_high_layout)
+        self.param_widgets['canny_high'] = [lbl, self.slider_canny_high, self.lbl_canny_high]
         
         # Gaussian sigma
-        sigma_layout = QVBoxLayout()
-        sigma_layout.addWidget(QLabel("Gaussian σ:"))
+        self.sigma_layout = QVBoxLayout()
+        lbl = QLabel("Gaussian σ:")
+        self.sigma_layout.addWidget(lbl)
         self.slider_sigma = QSlider(Qt.Orientation.Horizontal)
         self.slider_sigma.setRange(1, 50)
         self.slider_sigma.setValue(int(self.params['gaussian_sigma'] * 10))
         self.slider_sigma.valueChanged.connect(lambda v: self.update_param('gaussian_sigma', v / 10.0))
         self.lbl_sigma = QLabel(f"{self.params['gaussian_sigma']:.1f}")
-        sigma_layout.addWidget(self.slider_sigma)
-        sigma_layout.addWidget(self.lbl_sigma)
-        param_layout.addLayout(sigma_layout)
+        self.sigma_layout.addWidget(self.slider_sigma)
+        self.sigma_layout.addWidget(self.lbl_sigma)
+        param_layout.addLayout(self.sigma_layout)
+        self.param_widgets['gaussian_sigma'] = [lbl, self.slider_sigma, self.lbl_sigma]
         
         # CLAHE clip limit
-        clahe_layout = QVBoxLayout()
-        clahe_layout.addWidget(QLabel("CLAHE Clip:"))
+        self.clahe_layout = QVBoxLayout()
+        lbl = QLabel("CLAHE Clip:")
+        self.clahe_layout.addWidget(lbl)
         self.slider_clahe = QSlider(Qt.Orientation.Horizontal)
         self.slider_clahe.setRange(10, 100)
         self.slider_clahe.setValue(int(self.params['clahe_clip'] * 10))
         self.slider_clahe.valueChanged.connect(lambda v: self.update_param('clahe_clip', v / 10.0))
         self.lbl_clahe = QLabel(f"{self.params['clahe_clip']:.1f}")
-        clahe_layout.addWidget(self.slider_clahe)
-        clahe_layout.addWidget(self.lbl_clahe)
-        param_layout.addLayout(clahe_layout)
+        self.clahe_layout.addWidget(self.slider_clahe)
+        self.clahe_layout.addWidget(self.lbl_clahe)
+        param_layout.addLayout(self.clahe_layout)
+        self.param_widgets['clahe_clip'] = [lbl, self.slider_clahe, self.lbl_clahe]
+        
+        # Morph kernel
+        self.morph_layout = QVBoxLayout()
+        lbl = QLabel("Morph Kernel:")
+        self.morph_layout.addWidget(lbl)
+        self.slider_morph = QSlider(Qt.Orientation.Horizontal)
+        self.slider_morph.setRange(3, 15)
+        self.slider_morph.setValue(self.params['morph_kernel'])
+        self.slider_morph.valueChanged.connect(lambda v: self.update_param('morph_kernel', v))
+        self.lbl_morph = QLabel(str(self.params['morph_kernel']))
+        self.morph_layout.addWidget(self.slider_morph)
+        self.morph_layout.addWidget(self.lbl_morph)
+        param_layout.addLayout(self.morph_layout)
+        self.param_widgets['morph_kernel'] = [lbl, self.slider_morph, self.lbl_morph]
         
         # BBox padding
-        padding_layout = QVBoxLayout()
-        padding_layout.addWidget(QLabel("BBox Padding:"))
+        self.padding_layout = QVBoxLayout()
+        lbl = QLabel("BBox Padding:")
+        self.padding_layout.addWidget(lbl)
         self.slider_padding = QSlider(Qt.Orientation.Horizontal)
         self.slider_padding.setRange(0, 20)
         self.slider_padding.setValue(self.params['bbox_padding'])
         self.slider_padding.valueChanged.connect(lambda v: self.update_param('bbox_padding', v))
         self.lbl_padding = QLabel(str(self.params['bbox_padding']))
-        padding_layout.addWidget(self.slider_padding)
-        padding_layout.addWidget(self.lbl_padding)
-        param_layout.addLayout(padding_layout)
+        self.padding_layout.addWidget(self.slider_padding)
+        self.padding_layout.addWidget(self.lbl_padding)
+        param_layout.addLayout(self.padding_layout)
+        self.param_widgets['bbox_padding'] = [lbl, self.slider_padding, self.lbl_padding]
         
-        param_group.setLayout(param_layout)
+        # Snake parameters (second row)
+        param_layout2 = QHBoxLayout()
+        
+        # Snake Alpha
+        self.snake_alpha_layout = QVBoxLayout()
+        lbl = QLabel("Snake Alpha:")
+        self.snake_alpha_layout.addWidget(lbl)
+        self.slider_snake_alpha = QSlider(Qt.Orientation.Horizontal)
+        self.slider_snake_alpha.setRange(1, 100)
+        self.slider_snake_alpha.setValue(int(self.params['snake_alpha'] * 1000))
+        self.slider_snake_alpha.valueChanged.connect(lambda v: self.update_param('snake_alpha', v / 1000.0))
+        self.lbl_snake_alpha = QLabel(f"{self.params['snake_alpha']:.3f}")
+        self.snake_alpha_layout.addWidget(self.slider_snake_alpha)
+        self.snake_alpha_layout.addWidget(self.lbl_snake_alpha)
+        param_layout2.addLayout(self.snake_alpha_layout)
+        self.param_widgets['snake_alpha'] = [lbl, self.slider_snake_alpha, self.lbl_snake_alpha]
+        
+        # Snake Beta
+        self.snake_beta_layout = QVBoxLayout()
+        lbl = QLabel("Snake Beta:")
+        self.snake_beta_layout.addWidget(lbl)
+        self.slider_snake_beta = QSlider(Qt.Orientation.Horizontal)
+        self.slider_snake_beta.setRange(1, 500)
+        self.slider_snake_beta.setValue(int(self.params['snake_beta'] * 1000))
+        self.slider_snake_beta.valueChanged.connect(lambda v: self.update_param('snake_beta', v / 1000.0))
+        self.lbl_snake_beta = QLabel(f"{self.params['snake_beta']:.3f}")
+        self.snake_beta_layout.addWidget(self.slider_snake_beta)
+        self.snake_beta_layout.addWidget(self.lbl_snake_beta)
+        param_layout2.addLayout(self.snake_beta_layout)
+        self.param_widgets['snake_beta'] = [lbl, self.slider_snake_beta, self.lbl_snake_beta]
+        
+        # Snake Iterations
+        self.snake_iter_layout = QVBoxLayout()
+        lbl = QLabel("Snake Iterations:")
+        self.snake_iter_layout.addWidget(lbl)
+        self.slider_snake_iter = QSlider(Qt.Orientation.Horizontal)
+        self.slider_snake_iter.setRange(10, 500)
+        self.slider_snake_iter.setValue(self.params['snake_iterations'])
+        self.slider_snake_iter.valueChanged.connect(lambda v: self.update_param('snake_iterations', v))
+        self.lbl_snake_iter = QLabel(str(self.params['snake_iterations']))
+        self.snake_iter_layout.addWidget(self.slider_snake_iter)
+        self.snake_iter_layout.addWidget(self.lbl_snake_iter)
+        param_layout2.addLayout(self.snake_iter_layout)
+        self.param_widgets['snake_iterations'] = [lbl, self.slider_snake_iter, self.lbl_snake_iter]
+        
+        # Add layouts to main param layout
+        param_main_layout.addLayout(param_layout)
+        param_main_layout.addLayout(param_layout2)
+        
+        # Reset button
+        reset_layout = QHBoxLayout()
+        reset_layout.addStretch()
+        self.btn_reset_params = QPushButton("🔄 Reset Parameters")
+        self.btn_reset_params.clicked.connect(self.reset_parameters)
+        reset_layout.addWidget(self.btn_reset_params)
+        param_main_layout.addLayout(reset_layout)
+        
+        param_group.setLayout(param_main_layout)
         main_layout.addWidget(param_group)
         
         # Image viewer
@@ -263,6 +387,9 @@ class EdgeDetectionGUI(QMainWindow):
         self.pixmap_item = QGraphicsPixmapItem()
         self.scene.addItem(self.pixmap_item)
         main_layout.addWidget(self.view)
+        
+        # Initialize parameter visibility
+        self.on_algorithm_changed(self.combo_algorithm.currentText())
     
     def update_param(self, key: str, value):
         """Update parameter and refresh label."""
@@ -277,6 +404,41 @@ class EdgeDetectionGUI(QMainWindow):
             self.lbl_clahe.setText(f"{value:.1f}")
         elif key == 'bbox_padding':
             self.lbl_padding.setText(str(value))
+        elif key == 'morph_kernel':
+            self.lbl_morph.setText(str(value))
+        elif key == 'snake_alpha':
+            self.lbl_snake_alpha.setText(f"{value:.3f}")
+        elif key == 'snake_beta':
+            self.lbl_snake_beta.setText(f"{value:.3f}")
+        elif key == 'snake_iterations':
+            self.lbl_snake_iter.setText(str(value))
+    
+    def reset_parameters(self):
+        """Reset all parameters to default values."""
+        self.params = self.default_params.copy()
+        # Update sliders
+        self.slider_canny_low.setValue(self.params['canny_low'])
+        self.slider_canny_high.setValue(self.params['canny_high'])
+        self.slider_sigma.setValue(int(self.params['gaussian_sigma'] * 10))
+        self.slider_clahe.setValue(int(self.params['clahe_clip'] * 10))
+        self.slider_padding.setValue(self.params['bbox_padding'])
+        self.slider_morph.setValue(self.params['morph_kernel'])
+        self.slider_snake_alpha.setValue(int(self.params['snake_alpha'] * 1000))
+        self.slider_snake_beta.setValue(int(self.params['snake_beta'] * 1000))
+        self.slider_snake_iter.setValue(self.params['snake_iterations'])
+    
+    def on_algorithm_changed(self, algo_name: str):
+        """Enable/disable parameters based on selected algorithm."""
+        if algo_name not in self.algorithms:
+            return
+        
+        used_params = self.algorithms[algo_name]['params']
+        
+        # Enable/disable each parameter widget
+        for param_key, widgets in self.param_widgets.items():
+            enabled = param_key in used_params
+            for widget in widgets:
+                widget.setEnabled(enabled)
         
     def load_or_create_session(self):
         """Load existing sessions or create new session entry."""
@@ -386,13 +548,13 @@ class EdgeDetectionGUI(QMainWindow):
         # Save current zoom level
         current_zoom = self.view.get_zoom_level()
         
-        # Draw bounding box if available
+        # Draw bounding box if available (thinner lines)
         display_img = img.copy()
         if self.current_bbox is not None:
             x1, y1, x2, y2 = self.current_bbox
-            cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(display_img, "YOLO BBox", (x1, max(20, y1 - 10)),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 1)  # thickness 1
+            cv2.putText(display_img, "YOLO BBox", (x1, max(15, y1 - 5)),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)  # smaller font, thickness 1
         
         # Convert BGR to RGB for Qt
         rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
@@ -403,11 +565,13 @@ class EdgeDetectionGUI(QMainWindow):
         
         self.pixmap_item.setPixmap(pixmap)
         
-        # Restore zoom level
+        # Restore zoom level or fit to view with better initial size
         if current_zoom > 1.01:  # Only restore if significantly zoomed
             self.view.set_zoom_level(current_zoom)
         else:
+            # Fit to 80% of view to give better initial display
             self.view.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+            self.view.scale(0.95, 0.95)  # Slightly zoom in for better visibility
     
     def prev_image(self):
         """Load previous image."""
@@ -462,7 +626,7 @@ class EdgeDetectionGUI(QMainWindow):
             return
         
         algo_name = self.combo_algorithm.currentText()
-        algo_func = self.algorithms[algo_name]
+        algo_func = self.algorithms[algo_name]['func']
         
         # Measure runtime
         start = time.perf_counter()
@@ -482,7 +646,37 @@ class EdgeDetectionGUI(QMainWindow):
         """Apply auto-threshold Canny within bbox (with padding)."""
         roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
         
-        edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=self.params['gaussian_sigma'])
+        # Convert to grayscale for threshold computation
+        if len(roi.shape) == 3:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = roi.copy()
+        
+        # Apply Gaussian blur if sigma > 0
+        if self.params['gaussian_sigma'] > 0:
+            ksize = int(2 * round(3 * self.params['gaussian_sigma']) + 1)
+            gray = cv2.GaussianBlur(gray, (ksize, ksize), self.params['gaussian_sigma'])
+        
+        # Compute auto thresholds
+        v = np.median(gray)
+        sigma = 0.33
+        lower = int(max(0, (1.0 - sigma) * v))
+        upper = int(min(255, (1.0 + sigma) * v))
+        
+        # Apply Canny
+        edges = cv2.Canny(gray, lower, upper)
+        
+        # Update sliders with computed thresholds
+        self.slider_canny_low.blockSignals(True)
+        self.slider_canny_high.blockSignals(True)
+        self.slider_canny_low.setValue(lower)
+        self.slider_canny_high.setValue(upper)
+        self.slider_canny_low.blockSignals(False)
+        self.slider_canny_high.blockSignals(False)
+        
+        # Update parameter display labels
+        self.lbl_canny_low.setText(f"Canny Low: {lower}")
+        self.lbl_canny_high.setText(f"Canny High: {upper}")
         
         # Overlay on original
         result = self.current_image.copy()
@@ -631,6 +825,113 @@ class EdgeDetectionGUI(QMainWindow):
         # Place back in full image
         result = self.current_image.copy()
         result[y1:y2, x1:x2] = roi_with_lines
+        
+        return result
+    
+    def apply_structured_edges(self) -> np.ndarray:
+        """Apply structured edge detection within bbox (with padding).
+        
+        Uses multi-scale gradient fusion as a proxy for structured forests,
+        since the structured forests model requires pre-trained weights.
+        """
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur
+        ksize = int(2 * round(3 * self.params['gaussian_sigma']) + 1)
+        blurred = cv2.GaussianBlur(gray, (ksize, ksize), self.params['gaussian_sigma'])
+        
+        # Multi-scale gradient computation (3 scales)
+        scales = [1, 2, 3]
+        gradient_maps = []
+        
+        for scale in scales:
+            # Compute gradients at this scale
+            ksize_scale = 2 * scale + 1
+            sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=ksize_scale)
+            sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=ksize_scale)
+            magnitude = np.sqrt(sobelx**2 + sobely**2)
+            gradient_maps.append(magnitude)
+        
+        # Normalize and fuse gradients
+        fused = np.zeros_like(gradient_maps[0])
+        for gmap in gradient_maps:
+            normalized = gmap / (gmap.max() + 1e-8)
+            fused += normalized
+        
+        fused = fused / len(scales)
+        fused = np.uint8(255 * fused)
+        
+        # Apply adaptive threshold for edge extraction
+        edges = cv2.adaptiveThreshold(
+            fused, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Invert (we want edges as white)
+        edges = 255 - edges
+        
+        # Overlay on original
+        result = self.current_image.copy()
+        result[y1:y2, x1:x2][edges > 0] = [128, 0, 128]  # Purple
+        
+        return result
+    
+    def apply_active_contours(self) -> np.ndarray:
+        """Apply Active Contours (Snake) within bbox (with padding).
+        
+        Initializes a contour at the bbox boundary and evolves it toward edges.
+        """
+        from skimage.segmentation import active_contour
+        from skimage.filters import gaussian
+        
+        roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian smoothing
+        smoothed = gaussian(gray, self.params['gaussian_sigma'])
+        
+        # Initialize circular contour in center of ROI
+        roi_h, roi_w = gray.shape
+        center_y, center_x = roi_h // 2, roi_w // 2
+        radius = min(roi_h, roi_w) // 3
+        
+        # Create circular initialization
+        theta = np.linspace(0, 2 * np.pi, 100)
+        init_x = center_x + radius * np.cos(theta)
+        init_y = center_y + radius * np.sin(theta)
+        init_contour = np.array([init_x, init_y]).T
+        
+        # Evolve the contour
+        try:
+            snake = active_contour(
+                smoothed,
+                init_contour,
+                alpha=self.params['snake_alpha'],
+                beta=self.params['snake_beta'],
+                gamma=0.01,
+                max_iterations=self.params['snake_iterations'],
+                w_line=-1,  # Attract to dark lines (edges)
+                w_edge=2    # Strong edge attraction
+            )
+            
+            # Draw the snake on ROI
+            roi_result = roi.copy()
+            snake_int = snake.astype(np.int32)
+            cv2.polylines(roi_result, [snake_int], isClosed=True, color=(255, 128, 0), thickness=2)
+            
+            # Place back in full image
+            result = self.current_image.copy()
+            result[y1:y2, x1:x2] = roi_result
+            
+        except Exception as e:
+            # If snake fails, fallback to showing initialization
+            result = self.current_image.copy()
+            roi_result = roi.copy()
+            init_int = init_contour.astype(np.int32)
+            cv2.polylines(roi_result, [init_int], isClosed=True, color=(255, 128, 0), thickness=2)
+            result[y1:y2, x1:x2] = roi_result
+            print(f"Active contour failed: {e}")
         
         return result
     
