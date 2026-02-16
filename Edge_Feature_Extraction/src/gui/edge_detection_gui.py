@@ -36,6 +36,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSlider,
     QGroupBox,
+    QCheckBox,
+    QRadioButton,
+    QButtonGroup,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QImage, QWheelEvent
@@ -47,6 +50,14 @@ from algorithms.preproc import apply_clahe
 from algorithms.canny_pipeline import canny_edge_detection
 from algorithms.contour_silhouette import extract_silhouette_from_contours
 from algorithms.hough_ransac import hough_lines_probabilistic
+
+# YOLO imports
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("Warning: ultralytics not installed. SVO Mode will not be available.")
 
 
 class ZoomableGraphicsView(QGraphicsView):
@@ -95,11 +106,22 @@ class EdgeDetectionGUI(QMainWindow):
         self.setWindowTitle("Edge Detection Algorithm Tester")
         self.setGeometry(100, 100, 1400, 900)
         
-        # Paths
+        # Paths - Debug Mode
         self.project_root = Path(__file__).parent.parent.parent
         self.debug_images_dir = self.project_root / "data" / "debug_images" / "debug"
         self.labels_dir = self.project_root / "data" / "debug_images" / "labels"
         self.output_dir = self.project_root / "data" / "algorithm_outputs"
+        
+        # Paths - SVO Mode
+        self.svo_base_dir = Path("/media/angelo/DRONE_DATA1/SVO2_Frame_Export")
+        self.yolo_model_path = Path("/media/angelo/DRONE_DATA1/JetsonExport/svo_model_20251204_112724_1280/models/best.pt")
+        self.yolo_model = None
+        
+        # Mode selection
+        self.current_mode = "debug"  # "debug" or "svo"
+        self.svo_folders = []
+        self.current_svo_folder = None
+        self.current_depth_data = None
         
         # Session management
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -113,6 +135,8 @@ class EdgeDetectionGUI(QMainWindow):
         self.current_result: Optional[np.ndarray] = None
         self.current_bbox: Optional[Tuple[int, int, int, int]] = None
         self.last_runtime_ms: float = 0.0
+        self.yolo_inference_time: float = 0.0
+        self.edge_detection_time: float = 0.0
         
         # Algorithm parameters
         self.params = {
@@ -126,6 +150,8 @@ class EdgeDetectionGUI(QMainWindow):
             'snake_alpha': 0.01,  # Active contour elasticity
             'snake_beta': 0.1,    # Active contour stiffness
             'snake_iterations': 100,
+            'depth_radius': 5,    # Depth filter: search radius for valid depth
+            'use_depth_filter': False,  # Enable/disable depth filtering
         }
         
         # Default parameter values (for reset)
@@ -135,55 +161,85 @@ class EdgeDetectionGUI(QMainWindow):
         self.algorithms = {
             "Canny (Auto)": {
                 'func': self.apply_canny_auto,
-                'params': ['gaussian_sigma', 'bbox_padding']
+                'params': ['gaussian_sigma']
             },
             "CLAHE + Canny": {
                 'func': self.apply_clahe_canny,
-                'params': ['clahe_clip', 'gaussian_sigma', 'bbox_padding']
+                'params': ['clahe_clip', 'gaussian_sigma']
             },
             "Canny (Manual)": {
                 'func': self.apply_canny_manual,
-                'params': ['canny_low', 'canny_high', 'gaussian_sigma', 'bbox_padding']
+                'params': ['canny_low', 'canny_high', 'gaussian_sigma']
             },
             "Sobel Magnitude": {
                 'func': self.apply_sobel,
-                'params': ['gaussian_sigma', 'bbox_padding']
+                'params': ['gaussian_sigma']
             },
             "Laplacian of Gaussian": {
                 'func': self.apply_log,
-                'params': ['gaussian_sigma', 'bbox_padding']
+                'params': ['gaussian_sigma']
             },
             "Multi-scale Canny": {
                 'func': self.apply_multiscale_canny,
-                'params': ['bbox_padding']
+                'params': []
             },
             "Structured Edges": {
                 'func': self.apply_structured_edges,
-                'params': ['bbox_padding']
+                'params': ['gaussian_sigma']
             },
             "Active Contours (Snake)": {
                 'func': self.apply_active_contours,
-                'params': ['gaussian_sigma', 'snake_alpha', 'snake_beta', 'snake_iterations', 'bbox_padding']
+                'params': ['gaussian_sigma', 'snake_alpha', 'snake_beta', 'snake_iterations']
             },
             "Canny + Contour Silhouette": {
                 'func': self.apply_canny_contour,
-                'params': ['gaussian_sigma', 'morph_kernel', 'bbox_padding']
+                'params': ['gaussian_sigma', 'morph_kernel']
             },
             "Canny + Hough Lines": {
                 'func': self.apply_canny_hough,
-                'params': ['gaussian_sigma', 'bbox_padding']
+                'params': ['gaussian_sigma']
             },
         }
         
         self.init_ui()
-        self.load_image_list()
-        self.load_first_image()
-        
+        # Don't load images yet - wait for mode initialization
+        # self.load_image_list()
+        # self.load_first_image()
+    
     def init_ui(self):
         """Initialize the user interface."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        
+        # Mode selection panel
+        mode_layout = QHBoxLayout()
+        mode_group = QGroupBox("Operation Mode")
+        mode_group_layout = QHBoxLayout()
+        
+        self.mode_button_group = QButtonGroup()
+        self.radio_debug_mode = QRadioButton("Debug Mode (YOLO Labels)")
+        self.radio_svo_mode = QRadioButton("SVO Mode (YOLO Inference + Depth)")
+        self.radio_debug_mode.setChecked(True)
+        
+        self.mode_button_group.addButton(self.radio_debug_mode)
+        self.mode_button_group.addButton(self.radio_svo_mode)
+        
+        self.radio_debug_mode.toggled.connect(self.on_mode_changed)
+        
+        mode_group_layout.addWidget(self.radio_debug_mode)
+        mode_group_layout.addWidget(self.radio_svo_mode)
+        
+        # SVO folder selection (only visible in SVO mode)
+        self.lbl_svo_folder = QLabel("SVO Folder:")
+        self.combo_svo_folder = QComboBox()
+        # Don't connect signal yet - will be connected after folders are loaded
+        # self.combo_svo_folder.currentTextChanged.connect(self.on_svo_folder_changed)
+        mode_group_layout.addWidget(self.lbl_svo_folder)
+        mode_group_layout.addWidget(self.combo_svo_folder)
+        
+        mode_group.setLayout(mode_group_layout)
+        main_layout.addWidget(mode_group)
         
         # Control panel
         control_layout = QHBoxLayout()
@@ -218,6 +274,11 @@ class EdgeDetectionGUI(QMainWindow):
         
         self.lbl_runtime = QLabel("Runtime: -- ms | FPS: --")
         algo_layout.addWidget(self.lbl_runtime)
+        
+        # Detailed timing (only visible in SVO mode)
+        self.lbl_detailed_timing = QLabel("")
+        algo_layout.addWidget(self.lbl_detailed_timing)
+        self.lbl_detailed_timing.setVisible(False)
         
         algo_layout.addStretch()
         
@@ -306,20 +367,6 @@ class EdgeDetectionGUI(QMainWindow):
         param_layout.addLayout(self.morph_layout)
         self.param_widgets['morph_kernel'] = [lbl, self.slider_morph, self.lbl_morph]
         
-        # BBox padding
-        self.padding_layout = QVBoxLayout()
-        lbl = QLabel("BBox Padding:")
-        self.padding_layout.addWidget(lbl)
-        self.slider_padding = QSlider(Qt.Orientation.Horizontal)
-        self.slider_padding.setRange(0, 20)
-        self.slider_padding.setValue(self.params['bbox_padding'])
-        self.slider_padding.valueChanged.connect(lambda v: self.update_param('bbox_padding', v))
-        self.lbl_padding = QLabel(str(self.params['bbox_padding']))
-        self.padding_layout.addWidget(self.slider_padding)
-        self.padding_layout.addWidget(self.lbl_padding)
-        param_layout.addLayout(self.padding_layout)
-        self.param_widgets['bbox_padding'] = [lbl, self.slider_padding, self.lbl_padding]
-        
         # Snake parameters (second row)
         param_layout2 = QHBoxLayout()
         
@@ -365,6 +412,35 @@ class EdgeDetectionGUI(QMainWindow):
         param_layout2.addLayout(self.snake_iter_layout)
         self.param_widgets['snake_iterations'] = [lbl, self.slider_snake_iter, self.lbl_snake_iter]
         
+        # Depth Filter (SVO Mode only)
+        self.depth_layout = QVBoxLayout()
+        depth_control_layout = QHBoxLayout()
+        
+        self.chk_use_depth = QCheckBox("Enable Depth Filter")
+        self.chk_use_depth.setChecked(self.params['use_depth_filter'])
+        self.chk_use_depth.stateChanged.connect(lambda state: self.update_param('use_depth_filter', state == Qt.CheckState.Checked.value))
+        depth_control_layout.addWidget(self.chk_use_depth)
+        
+        lbl_depth = QLabel("Depth Search Radius (px):")
+        depth_control_layout.addWidget(lbl_depth)
+        
+        self.slider_depth_radius = QSlider(Qt.Orientation.Horizontal)
+        self.slider_depth_radius.setRange(1, 50)
+        self.slider_depth_radius.setValue(self.params['depth_radius'])
+        self.slider_depth_radius.valueChanged.connect(lambda v: self.update_param('depth_radius', v))
+        depth_control_layout.addWidget(self.slider_depth_radius)
+        
+        self.lbl_depth_radius = QLabel(str(self.params['depth_radius']))
+        depth_control_layout.addWidget(self.lbl_depth_radius)
+        
+        self.depth_layout.addLayout(depth_control_layout)
+        param_layout2.addLayout(self.depth_layout)
+        self.param_widgets['depth_radius'] = [self.chk_use_depth, lbl_depth, self.slider_depth_radius, self.lbl_depth_radius]
+        
+        # Hide depth filter initially (only for SVO mode)
+        for widget in self.param_widgets['depth_radius']:
+            widget.setVisible(False)
+        
         # Add layouts to main param layout
         param_main_layout.addLayout(param_layout)
         param_main_layout.addLayout(param_layout2)
@@ -390,6 +466,115 @@ class EdgeDetectionGUI(QMainWindow):
         
         # Initialize parameter visibility
         self.on_algorithm_changed(self.combo_algorithm.currentText())
+        
+        # Initialize SVO mode components
+        self.init_svo_mode()
+    
+    def init_svo_mode(self):
+        """Initialize SVO mode components."""
+        # Load available SVO folders
+        if self.svo_base_dir.exists():
+            self.svo_folders = sorted([
+                f for f in self.svo_base_dir.iterdir()
+                if f.is_dir() and f.name[0].isdigit()  # Folders like 1.1, 1.2, etc.
+            ])
+            # Add items without triggering signals
+            for folder in self.svo_folders:
+                self.combo_svo_folder.addItem(folder.name)
+        
+        # Now connect the signal after items are added
+        self.combo_svo_folder.currentTextChanged.connect(self.on_svo_folder_changed)
+        
+        # Hide SVO controls initially (debug mode is default)
+        self.lbl_svo_folder.setVisible(False)
+        self.combo_svo_folder.setVisible(False)
+        
+        # Load YOLO model if available
+        if YOLO_AVAILABLE and self.yolo_model_path.exists():
+            try:
+                self.yolo_model = YOLO(str(self.yolo_model_path))
+                print(f"YOLO model loaded: {self.yolo_model_path}")
+            except Exception as e:
+                print(f"Failed to load YOLO model: {e}")
+                self.yolo_model = None
+        else:
+            if not YOLO_AVAILABLE:
+                print("YOLO not available: ultralytics not installed")
+            elif not self.yolo_model_path.exists():
+                print(f"YOLO model not found: {self.yolo_model_path}")
+        
+        # Load initial images (Debug Mode is default)
+        self.load_image_list()
+        self.load_first_image()
+    
+    def on_mode_changed(self, checked: bool):
+        """Handle mode switch between Debug and SVO mode."""
+        if not checked:
+            return
+        
+        if self.radio_debug_mode.isChecked():
+            self.current_mode = "debug"
+            # Show debug mode controls, hide SVO controls
+            self.lbl_svo_folder.setVisible(False)
+            self.combo_svo_folder.setVisible(False)
+            self.lbl_detailed_timing.setVisible(False)
+            for widget in self.param_widgets['depth_radius']:
+                widget.setVisible(False)
+            
+            # Load debug images
+            self.load_image_list()
+            self.load_first_image()
+            
+        elif self.radio_svo_mode.isChecked():
+            self.current_mode = "svo"
+            # Show SVO mode controls
+            self.lbl_svo_folder.setVisible(True)
+            self.combo_svo_folder.setVisible(True)
+            self.lbl_detailed_timing.setVisible(True)
+            for widget in self.param_widgets['depth_radius']:
+                widget.setVisible(True)
+            
+            # Check if YOLO is available
+            if not self.yolo_model:
+                QMessageBox.warning(
+                    self,
+                    "YOLO Not Available",
+                    "YOLO model is not available. Please install ultralytics or check model path."
+                )
+                self.radio_debug_mode.setChecked(True)
+                return
+            
+            # Load SVO images
+            if self.combo_svo_folder.count() > 0:
+                self.on_svo_folder_changed(self.combo_svo_folder.currentText())
+    
+    def on_svo_folder_changed(self, folder_name: str):
+        """Handle SVO folder selection change."""
+        if not folder_name:
+            return
+        
+        # Only load if we're in SVO mode OR if this is being called during mode initialization
+        if self.current_mode != "svo":
+            return
+        
+        self.current_svo_folder = self.svo_base_dir / folder_name
+        self.load_svo_images()
+        if self.image_files:  # Only load if images were found
+            self.load_first_image()
+    
+    def load_svo_images(self):
+        """Load images from selected SVO folder."""
+        if not self.current_svo_folder or not self.current_svo_folder.exists():
+            return
+        
+        # Find all .jpg files (read-only, never modified)
+        self.image_files = sorted([
+            f for f in self.current_svo_folder.iterdir()
+            if f.suffix.lower() == '.jpg'
+        ])
+        
+        if not self.image_files:
+            QMessageBox.warning(self, "Warning", f"No images found in {self.current_svo_folder}")
     
     def update_param(self, key: str, value):
         """Update parameter and refresh label."""
@@ -402,8 +587,6 @@ class EdgeDetectionGUI(QMainWindow):
             self.lbl_sigma.setText(f"{value:.1f}")
         elif key == 'clahe_clip':
             self.lbl_clahe.setText(f"{value:.1f}")
-        elif key == 'bbox_padding':
-            self.lbl_padding.setText(str(value))
         elif key == 'morph_kernel':
             self.lbl_morph.setText(str(value))
         elif key == 'snake_alpha':
@@ -412,6 +595,11 @@ class EdgeDetectionGUI(QMainWindow):
             self.lbl_snake_beta.setText(f"{value:.3f}")
         elif key == 'snake_iterations':
             self.lbl_snake_iter.setText(str(value))
+        elif key == 'depth_radius':
+            self.lbl_depth_radius.setText(str(value))
+        elif key == 'use_depth_filter':
+            # Boolean value, no label update needed
+            pass
     
     def reset_parameters(self):
         """Reset all parameters to default values."""
@@ -421,11 +609,12 @@ class EdgeDetectionGUI(QMainWindow):
         self.slider_canny_high.setValue(self.params['canny_high'])
         self.slider_sigma.setValue(int(self.params['gaussian_sigma'] * 10))
         self.slider_clahe.setValue(int(self.params['clahe_clip'] * 10))
-        self.slider_padding.setValue(self.params['bbox_padding'])
         self.slider_morph.setValue(self.params['morph_kernel'])
         self.slider_snake_alpha.setValue(int(self.params['snake_alpha'] * 1000))
         self.slider_snake_beta.setValue(int(self.params['snake_beta'] * 1000))
         self.slider_snake_iter.setValue(self.params['snake_iterations'])
+        self.slider_depth_radius.setValue(self.params['depth_radius'])
+        self.chk_use_depth.setChecked(self.params['use_depth_filter'])
     
     def on_algorithm_changed(self, algo_name: str):
         """Enable/disable parameters based on selected algorithm."""
@@ -489,27 +678,67 @@ class EdgeDetectionGUI(QMainWindow):
             self.load_current_image()
     
     def load_current_image(self):
-        """Load current image and its YOLO labels."""
+        """Load current image and its YOLO labels or run YOLO inference."""
         if not self.image_files:
             return
         
         img_path = self.image_files[self.current_image_idx]
+        # Read-only: Never modify original files
         self.current_image = cv2.imread(str(img_path))
         
         if self.current_image is None:
             QMessageBox.warning(self, "Error", f"Failed to load image:\n{img_path}")
             return
         
-        # Load YOLO labels
-        label_path = self.labels_dir / f"{img_path.stem}.txt"
-        self.current_bbox = self.load_yolo_bbox(label_path, self.current_image.shape)
+        # Mode-specific loading
+        if self.current_mode == "debug":
+            # Load YOLO labels from file
+            label_path = self.labels_dir / f"{img_path.stem}.txt"
+            self.current_bbox = self.load_yolo_bbox(label_path, self.current_image.shape)
+            self.current_depth_data = None
+            
+        elif self.current_mode == "svo":
+            # Run YOLO inference + load depth data
+            self.current_bbox = None
+            self.current_depth_data = None
+            
+            # Load depth data (.npy file)
+            depth_path = img_path.with_suffix('.npy')
+            if depth_path.exists():
+                try:
+                    self.current_depth_data = np.load(str(depth_path))
+                except Exception as e:
+                    print(f"Failed to load depth data: {e}")
+                    self.current_depth_data = None
+            
+            # Run YOLO inference
+            if self.yolo_model:
+                try:
+                    start_yolo = time.perf_counter()
+                    results = self.yolo_model(self.current_image, verbose=False)
+                    end_yolo = time.perf_counter()
+                    self.yolo_inference_time = (end_yolo - start_yolo) * 1000.0
+                    
+                    # Extract first detection bbox
+                    if len(results) > 0 and len(results[0].boxes) > 0:
+                        box = results[0].boxes[0]  # First detection
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        self.current_bbox = (x1, y1, x2, y2)
+                    else:
+                        QMessageBox.information(self, "No Detection", "YOLO did not detect any objects in this image.")
+                except Exception as e:
+                    QMessageBox.warning(self, "YOLO Error", f"YOLO inference failed: {e}")
+                    self.yolo_inference_time = 0.0
         
         # Update UI
         self.lbl_image_info.setText(f"Image {self.current_image_idx + 1}/{len(self.image_files)}: {img_path.name}")
-        self.display_image(self.current_image)
+        # Display image WITHOUT bbox initially (bbox will be drawn after algorithm is applied)
+        self.display_image(self.current_image, draw_bbox=True)
         self.current_result = None
         self.btn_save.setEnabled(False)
         self.lbl_runtime.setText("Runtime: -- ms | FPS: --")
+        self.lbl_detailed_timing.setText("")
     
     def load_yolo_bbox(self, label_path: Path, img_shape: Tuple[int, int, int]) -> Optional[Tuple[int, int, int, int]]:
         """Load first bounding box from YOLO label file."""
@@ -543,14 +772,19 @@ class EdgeDetectionGUI(QMainWindow):
             print(f"Error loading bbox from {label_path}: {e}")
             return None
     
-    def display_image(self, img: np.ndarray):
-        """Display image in the viewer, preserving zoom level."""
+    def display_image(self, img: np.ndarray, draw_bbox: bool = True):
+        """Display image in the viewer, preserving zoom level.
+        
+        Args:
+            img: Image to display
+            draw_bbox: If True, draw the bounding box on the image
+        """
         # Save current zoom level
         current_zoom = self.view.get_zoom_level()
         
-        # Draw bounding box if available (thinner lines)
+        # Draw bounding box if requested and available
         display_img = img.copy()
-        if self.current_bbox is not None:
+        if draw_bbox and self.current_bbox is not None:
             x1, y1, x2, y2 = self.current_bbox
             cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 1)  # thickness 1
             cv2.putText(display_img, "YOLO BBox", (x1, max(15, y1 - 5)),
@@ -587,33 +821,71 @@ class EdgeDetectionGUI(QMainWindow):
     
     def get_roi_with_padding(self) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
         """
-        Extract ROI from image with padding to avoid bbox edge artifacts.
-        Returns (roi_image, adjusted_bbox_in_roi)
+        Extract ROI from image based on bbox.
+        Returns (roi_image, bbox_coordinates)
+        
+        Note: No padding is applied since bbox is drawn AFTER algorithm processing.
         """
         if self.current_bbox is None or self.current_image is None:
             return self.current_image, None
         
         x1, y1, x2, y2 = self.current_bbox
         h, w = self.current_image.shape[:2]
-        pad = self.params['bbox_padding']
-        
-        # Apply padding (inward to avoid bbox edges)
-        x1_pad = min(x1 + pad, x2 - 1)
-        y1_pad = min(y1 + pad, y2 - 1)
-        x2_pad = max(x2 - pad, x1 + 1)
-        y2_pad = max(y2 - pad, y1 + 1)
         
         # Clamp to image bounds
-        x1_pad = max(0, x1_pad)
-        y1_pad = max(0, y1_pad)
-        x2_pad = min(w, x2_pad)
-        y2_pad = min(h, y2_pad)
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(0, min(w - 1, x2))
+        y2 = max(0, min(h - 1, y2))
         
         # Extract ROI
-        roi = self.current_image[y1_pad:y2_pad, x1_pad:x2_pad].copy()
+        roi = self.current_image[y1:y2, x1:x2].copy()
         
-        # Return ROI and adjusted bbox (in original image coordinates)
-        return roi, (x1_pad, y1_pad, x2_pad, y2_pad)
+        # Return ROI and bbox (in original image coordinates)
+        return roi, (x1, y1, x2, y2)
+    
+    def has_valid_depth(self, contour, bbox_offset: Tuple[int, int]) -> bool:
+        """
+        Check if a contour has valid depth data within search radius.
+        
+        Args:
+            contour: OpenCV contour in ROI coordinates
+            bbox_offset: (x_offset, y_offset) to convert ROI coords to image coords
+        
+        Returns:
+            True if valid depth found within radius, False otherwise
+        """
+        if not self.params['use_depth_filter'] or self.current_depth_data is None:
+            return True  # No filtering if disabled or no depth data
+        
+        x_offset, y_offset = bbox_offset
+        radius = self.params['depth_radius']
+        depth_h, depth_w = self.current_depth_data.shape
+        
+        # Sample points along the contour
+        num_samples = min(len(contour), 20)  # Sample up to 20 points
+        indices = np.linspace(0, len(contour) - 1, num_samples, dtype=int)
+        
+        for idx in indices:
+            pt = contour[idx][0]  # contour point in ROI coords
+            # Convert to image coords
+            x_img = pt[0] + x_offset
+            y_img = pt[1] + y_offset
+            
+            # Search in neighborhood
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    check_x = x_img + dx
+                    check_y = y_img + dy
+                    
+                    # Bounds check
+                    if 0 <= check_y < depth_h and 0 <= check_x < depth_w:
+                        depth_val = self.current_depth_data[check_y, check_x]
+                        # Valid depth is non-zero and not NaN/Inf
+                        if depth_val > 0 and np.isfinite(depth_val):
+                            return True
+        
+        return False  # No valid depth found
     
     def apply_algorithm(self):
         """Apply selected algorithm to current image."""
@@ -628,18 +900,31 @@ class EdgeDetectionGUI(QMainWindow):
         algo_name = self.combo_algorithm.currentText()
         algo_func = self.algorithms[algo_name]['func']
         
-        # Measure runtime
-        start = time.perf_counter()
+        # Measure edge detection runtime
+        start_edge = time.perf_counter()
         result = algo_func()
-        end = time.perf_counter()
+        end_edge = time.perf_counter()
         
-        self.last_runtime_ms = (end - start) * 1000.0
+        self.edge_detection_time = (end_edge - start_edge) * 1000.0
+        self.last_runtime_ms = self.edge_detection_time
         fps = 1000.0 / self.last_runtime_ms if self.last_runtime_ms > 0 else 0
         
+        # Update timing display
         self.lbl_runtime.setText(f"Runtime: {self.last_runtime_ms:.2f} ms | FPS: {fps:.1f}")
         
+        # Show detailed timing in SVO mode
+        if self.current_mode == "svo":
+            total_time = self.yolo_inference_time + self.edge_detection_time
+            timing_text = (
+                f"YOLO: {self.yolo_inference_time:.2f} ms | "
+                f"Edge: {self.edge_detection_time:.2f} ms | "
+                f"Total: {total_time:.2f} ms"
+            )
+            self.lbl_detailed_timing.setText(timing_text)
+        
         self.current_result = result
-        self.display_image(result)
+        # Draw bbox AFTER algorithm processing
+        self.display_image(result, draw_bbox=True)
         self.btn_save.setEnabled(True)
     
     def apply_canny_auto(self) -> np.ndarray:
@@ -774,16 +1059,34 @@ class EdgeDetectionGUI(QMainWindow):
         return result
     
     def apply_canny_contour(self) -> np.ndarray:
-        """Apply Canny + contour silhouette within bbox (with padding)."""
+        """Apply Canny + contour silhouette within bbox (with depth filtering in SVO mode)."""
         roi, (x1, y1, x2, y2) = self.get_roi_with_padding()
         
         edges = canny_edge_detection(roi, auto_threshold=True, blur_sigma=self.params['gaussian_sigma'])
-        silhouette = extract_silhouette_from_contours(
-            edges, 
-            roi.shape, 
-            morph_kernel_size=self.params['morph_kernel'], 
-            min_area_ratio=0.01
-        )
+        
+        # Find contours
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Apply depth filtering if in SVO mode
+        if self.current_mode == "svo" and self.params['use_depth_filter']:
+            filtered_contours = []
+            for contour in contours:
+                if cv2.contourArea(contour) > 100:  # Minimum area threshold
+                    if self.has_valid_depth(contour, (x1, y1)):
+                        filtered_contours.append(contour)
+            contours = filtered_contours
+        
+        # Extract silhouette from filtered contours
+        silhouette = np.zeros(roi.shape[:2], dtype=np.uint8)
+        if contours:
+            cv2.drawContours(silhouette, contours, -1, 255, thickness=cv2.FILLED)
+            
+            # Apply morphology
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (self.params['morph_kernel'], self.params['morph_kernel'])
+            )
+            silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_CLOSE, kernel)
         
         # Overlay silhouette on original
         result = self.current_image.copy()
@@ -878,9 +1181,9 @@ class EdgeDetectionGUI(QMainWindow):
         return result
     
     def apply_active_contours(self) -> np.ndarray:
-        """Apply Active Contours (Snake) within bbox (with padding).
+        """Apply Active Contours (Snake) within bbox.
         
-        Initializes a contour at the bbox boundary and evolves it toward edges.
+        Initializes a contour slightly inside the bbox boundary and evolves it toward edges.
         """
         from skimage.segmentation import active_contour
         from skimage.filters import gaussian
@@ -891,15 +1194,30 @@ class EdgeDetectionGUI(QMainWindow):
         # Apply Gaussian smoothing
         smoothed = gaussian(gray, self.params['gaussian_sigma'])
         
-        # Initialize circular contour in center of ROI
+        # Initialize rectangular contour slightly inside ROI boundaries
         roi_h, roi_w = gray.shape
-        center_y, center_x = roi_h // 2, roi_w // 2
-        radius = min(roi_h, roi_w) // 3
+        margin = 10  # Pixels from edge
         
-        # Create circular initialization
-        theta = np.linspace(0, 2 * np.pi, 100)
-        init_x = center_x + radius * np.cos(theta)
-        init_y = center_y + radius * np.sin(theta)
+        # Create rectangular initialization (clockwise from top-left)
+        # Top edge
+        top_points = np.linspace(margin, roi_w - margin, 25)
+        top_y = np.full_like(top_points, margin)
+        
+        # Right edge
+        right_y = np.linspace(margin, roi_h - margin, 25)
+        right_x = np.full_like(right_y, roi_w - margin)
+        
+        # Bottom edge (reverse order for continuous path)
+        bottom_points = np.linspace(roi_w - margin, margin, 25)
+        bottom_y = np.full_like(bottom_points, roi_h - margin)
+        
+        # Left edge (reverse order)
+        left_y = np.linspace(roi_h - margin, margin, 25)
+        left_x = np.full_like(left_y, margin)
+        
+        # Combine all edges into one contour
+        init_x = np.concatenate([top_points, right_x, bottom_points, left_x])
+        init_y = np.concatenate([top_y, right_y, bottom_y, left_y])
         init_contour = np.array([init_x, init_y]).T
         
         # Evolve the contour
@@ -907,15 +1225,16 @@ class EdgeDetectionGUI(QMainWindow):
             snake = active_contour(
                 smoothed,
                 init_contour,
-                alpha=self.params['snake_alpha'],
-                beta=self.params['snake_beta'],
-                gamma=0.01,
-                max_iterations=self.params['snake_iterations'],
-                w_line=-1,  # Attract to dark lines (edges)
-                w_edge=2    # Strong edge attraction
+                alpha=self.params['snake_alpha'],      # Continuity (elasticity)
+                beta=self.params['snake_beta'],        # Smoothness (stiffness)
+                gamma=0.001,                           # Step size (smaller = more stable)
+                max_num_iter=self.params['snake_iterations'],  # Correct parameter name
+                w_line=0,                              # Don't attract to lines
+                w_edge=1,                              # Attract to edges
+                convergence=0.1                        # Convergence criterion
             )
             
-            # Draw the snake on ROI
+            # Draw the evolved snake on ROI
             roi_result = roi.copy()
             snake_int = snake.astype(np.int32)
             cv2.polylines(roi_result, [snake_int], isClosed=True, color=(255, 128, 0), thickness=2)
@@ -929,7 +1248,9 @@ class EdgeDetectionGUI(QMainWindow):
             result = self.current_image.copy()
             roi_result = roi.copy()
             init_int = init_contour.astype(np.int32)
-            cv2.polylines(roi_result, [init_int], isClosed=True, color=(255, 128, 0), thickness=2)
+            cv2.polylines(roi_result, [init_int], isClosed=True, color=(128, 128, 128), thickness=1)
+            cv2.putText(roi_result, f"Snake failed: {str(e)[:50]}", (10, 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
             result[y1:y2, x1:x2] = roi_result
             print(f"Active contour failed: {e}")
         
