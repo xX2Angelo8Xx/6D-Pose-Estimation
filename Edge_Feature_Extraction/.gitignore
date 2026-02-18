@@ -11,3 +11,9 @@ ENV/
 
 # data outputs
 data/
+
+# CAD-Edge-Generation outputs
+CAD-Edge-Generation/debug_images/
+CAD-Edge-Generation/*_simplified.stl
+CAD-Edge-Generation/*_medium.stl
+CAD-Edge-Generation/*.png
