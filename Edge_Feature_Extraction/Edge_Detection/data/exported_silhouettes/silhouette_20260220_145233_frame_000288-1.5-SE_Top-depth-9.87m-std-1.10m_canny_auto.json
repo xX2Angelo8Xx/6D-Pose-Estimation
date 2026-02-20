@@ -1,0 +1,18 @@
+{
+  "source_image": "/home/angelo/Projects/6D_Pose_Estimation/Edge_Feature_Extraction/Edge_Detection/data/debug_images/originals/frame_000288-1.5-SE_Top-depth-9.87m-std-1.10m.jpg",
+  "algorithm": "Canny (Auto)",
+  "image_size": [
+    1280,
+    720
+  ],
+  "bbox": [
+    858,
+    443,
+    1012,
+    508
+  ],
+  "n_edge_pixels": 490,
+  "runtime_ms": 2.8,
+  "export_timestamp": "2026-02-20T14:52:33.599595",
+  "mode": "debug"
+}

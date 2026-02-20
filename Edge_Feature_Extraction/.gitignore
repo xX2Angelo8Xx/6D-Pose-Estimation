@@ -9,11 +9,16 @@ venv/
 env/
 ENV/
 
-# data outputs
-data/
+# Large precomputed LUT files (>1 GB — regenerate with precompute_roll_lut.py)
+CAD-Edge-Generation/data/silhouette_lut_*.npz
+CAD-Edge-Generation/data/silhouette_lut_*.json
 
-# CAD-Edge-Generation outputs
+# CAD-Edge-Generation build artefacts
 CAD-Edge-Generation/debug_images/
-CAD-Edge-Generation/*_simplified.stl
 CAD-Edge-Generation/*_medium.stl
-CAD-Edge-Generation/*.png
+CAD-Edge-Generation/output/
+CAD-Edge-Generation/results/
+
+# Edge detection — user-specific training / debug images and auto-generated outputs
+Edge_Detection/data/debug_images/
+Edge_Detection/data/algorithm_outputs/
