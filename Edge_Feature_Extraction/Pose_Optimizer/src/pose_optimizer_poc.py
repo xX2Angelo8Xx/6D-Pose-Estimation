@@ -46,6 +46,7 @@ Usage
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -135,26 +136,50 @@ def chamfer_obs_to_model(obs_px: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PoseCostFunction:
-    """Closure over the fixed observed pixels and model world points.
+    """Closure over observed pixels and model world points.
 
-        When store_frames=True every call also saves a copy of model_px so that
-        the convergence animation can replay every evaluation step frame-by-frame.
-        History tuples:
-            store_frames=False : (az, el, dist, roll, cost)
-            store_frames=True  : (az, el, dist, roll, cost, model_px_copy)
+    The model_world points are refreshed from the LUT whenever the optimizer
+    crosses a LUT grid cell boundary, ensuring visibility-correct silhouettes
+    throughout the whole optimisation (not just at the warm-start pose).
+
+    History tuples:
+        store_frames=False : (az, el, dist, roll, cost)
+        store_frames=True  : (az, el, dist, roll, cost, model_px_copy)
     """
 
     def __init__(self,
                  observed_px: np.ndarray,
                  model_world: np.ndarray,
                  target: np.ndarray,
-                 store_frames: bool = False):
+                 store_frames: bool = False,
+                 lut_npz=None,
+                 angle_index: dict | None = None,
+                 lut_ref_dist: float = 10.0):
         self.observed_px   = observed_px
         self.model_world   = model_world
         self.target        = target
         self.store_frames  = store_frames
         self.n_evals       = 0
-        self.history: list[tuple] = []   # see docstring for tuple layout
+        self.history: list[tuple] = []
+
+        # ── LUT-refresh support ───────────────────────────────────────────
+        self._lut_tree = None
+        if lut_npz is not None and angle_index is not None:
+            ai = angle_index.get("angle_index", angle_index)
+            units, pkey_list = [], []
+            for az_el_key, pkey in ai.items():
+                az_s, el_s = az_el_key.split("_", 1)
+                ar = math.radians(float(az_s))
+                er = math.radians(float(el_s))
+                units.append([math.cos(er)*math.cos(ar),
+                               math.cos(er)*math.sin(ar),
+                               math.sin(er)])
+                pkey_list.append((pkey, float(az_s), float(el_s)))
+            self._lut_tree     = cKDTree(np.array(units, dtype=np.float32))
+            self._lut_pkeys    = pkey_list
+            self._lut_npz      = lut_npz
+            self._lut_ref_dist = lut_ref_dist
+            self._cached_key   = None
 
     def __call__(self, params: np.ndarray) -> float:
         az, el, dist, roll = params
@@ -163,6 +188,23 @@ class PoseCostFunction:
         az   = az % 360.0
         el   = float(np.clip(el, -89.0, 89.0))
         dist = float(np.clip(dist, 0.5, 50.0))
+
+        # ── LUT refresh: reload when optimizer enters a new grid cell ────────
+        if self._lut_tree is not None:
+            ar = math.radians(az)
+            er = math.radians(el)
+            unit = [math.cos(er)*math.cos(ar),
+                    math.cos(er)*math.sin(ar),
+                    math.sin(er)]
+            _, idx = self._lut_tree.query(unit)
+            pkey, snap_az, snap_el = self._lut_pkeys[idx]
+            if pkey != self._cached_key:
+                pts_cam = self._lut_npz[pkey].astype(np.float32)
+                snap_cp = self.target + spherical_to_cartesian_aircraft(
+                    snap_az, snap_el, self._lut_ref_dist)
+                snap_R  = compute_camera_transform(snap_cp, self.target)
+                self.model_world = cam_space_to_world(pts_cam, snap_R, snap_cp)
+                self._cached_key = pkey
 
         cam_pos = self.target + spherical_to_cartesian_aircraft(az, el, dist)
         R_cam   = compute_camera_transform(cam_pos, self.target)
@@ -283,7 +325,9 @@ def run_single(V, F, target,
 
     # ── 3. Nelder-Mead optimization ───────────────────────────────────────
     cost_fn = PoseCostFunction(observed_px, model_world, target,
-                               store_frames=visualize)
+                               store_frames=visualize,
+                               lut_npz=lut_npz, angle_index=angle_index,
+                               lut_ref_dist=true_dist)
 
     # include roll as a 4th variable (degrees). Warm-start from roll LUT or 0.
     x0 = np.array([init_az, init_el, init_dist, init_roll])
