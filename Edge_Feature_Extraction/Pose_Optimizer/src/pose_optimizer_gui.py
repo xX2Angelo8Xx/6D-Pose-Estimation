@@ -835,10 +835,10 @@ class SettingsPanel(QWidget):
             w.setFixedWidth(100)
             return w
 
-        self.spin_fx = dspin(800.0)
-        self.spin_fy = dspin(800.0)
-        self.spin_cx = dspin(640.0, lo=0.0)
-        self.spin_cy = dspin(360.0, lo=0.0)
+        self.spin_fx = dspin(951.1)   # ZED 2i S/N 34754237 @ HD720 — SDK-kalibriert
+        self.spin_fy = dspin(951.1)   # HFOV=67.8°  VFOV=40.2°
+        self.spin_cx = dspin(638.9, lo=0.0)
+        self.spin_cy = dspin(348.0, lo=0.0)
         cl.addRow("fx [px]:", self.spin_fx)
         cl.addRow("fy [px]:", self.spin_fy)
         cl.addRow("cx [px]:", self.spin_cx)

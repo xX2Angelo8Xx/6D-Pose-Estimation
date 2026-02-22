@@ -22,3 +22,9 @@ CAD-Edge-Generation/results/
 # Edge detection — user-specific training / debug images and auto-generated outputs
 Edge_Detection/data/debug_images/
 Edge_Detection/data/algorithm_outputs/
+
+# Exported silhouettes (test artefacts — regenerate by running edge detection + export)
+Edge_Detection/data/exported_silhouettes/
+
+# LUT quality tool outputs (regenerate with check_lut_quality.py)
+tools/lut_quality_output/
