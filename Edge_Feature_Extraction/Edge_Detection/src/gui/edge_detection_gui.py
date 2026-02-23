@@ -256,7 +256,9 @@ class EdgeDetectionGUI(QMainWindow):
         self.svo2_depth_mode: str = "NEURAL"                # depth mode name
         self.svo2_yolo_input_size: int = 1280               # YOLO inference width
         self.svo2_depth_opacity: float = 0.6                # depth overlay opacity
-        self.svo2_bbox: Optional[Tuple[int, int, int, int]] = None  # YOLO result in SVO2 mode
+        self.svo2_bbox: Optional[Tuple[int, int, int, int]] = None       # YOLO bbox – left frame
+        self.svo2_right_frame: Optional[np.ndarray] = None               # BGR right camera image
+        self.svo2_bbox_right: Optional[Tuple[int, int, int, int]] = None  # YOLO bbox – right frame
         self.svo2_show_depth_overlay: bool = True           # toggle overlay rendering
         # Default model directory (scanned at startup for .pt/.onnx/.engine files)
         self.yolo_model_dir = Path(
@@ -428,7 +430,8 @@ class EdgeDetectionGUI(QMainWindow):
         # Depth mode
         svo2_row1.addWidget(QLabel("Depth Mode:"))
         self.combo_svo2_depth_mode = QComboBox()
-        self.combo_svo2_depth_mode.addItems(["NEURAL", "ULTRA", "QUALITY", "PERFORMANCE", "NONE"])
+        # Only current (non-legacy) ZED SDK v5 depth modes – see docs/guides/zed_depth_modes.md
+        self.combo_svo2_depth_mode.addItems(["NEURAL_PLUS", "NEURAL", "NEURAL_LIGHT", "NONE"])
         self.combo_svo2_depth_mode.setCurrentText("NEURAL")
         self.combo_svo2_depth_mode.currentTextChanged.connect(self.on_svo2_depth_mode_changed)
         svo2_row1.addWidget(self.combo_svo2_depth_mode)
@@ -884,13 +887,13 @@ class EdgeDetectionGUI(QMainWindow):
         # Close any previously open camera
         self.svo2_close_camera()
 
-        # Map depth-mode name to SDK enum
+        # Map depth-mode name to SDK enum (ZED SDK v5 – AI modes only; legacy removed)
+        # See docs/guides/zed_depth_modes.md for details
         depth_mode_map = {
-            "NEURAL":      sl.DEPTH_MODE.NEURAL,
-            "ULTRA":       sl.DEPTH_MODE.ULTRA,
-            "QUALITY":     sl.DEPTH_MODE.QUALITY,
-            "PERFORMANCE": sl.DEPTH_MODE.PERFORMANCE,
-            "NONE":        sl.DEPTH_MODE.NONE,
+            "NEURAL_PLUS":  sl.DEPTH_MODE.NEURAL_PLUS,
+            "NEURAL":       sl.DEPTH_MODE.NEURAL,
+            "NEURAL_LIGHT": sl.DEPTH_MODE.NEURAL_LIGHT,
+            "NONE":         sl.DEPTH_MODE.NONE,
         }
         depth_mode = depth_mode_map.get(self.svo2_depth_mode, sl.DEPTH_MODE.NEURAL)
 
@@ -923,8 +926,10 @@ class EdgeDetectionGUI(QMainWindow):
                 pass
             self.zed_camera = None
         self.svo2_raw_frame = None
+        self.svo2_right_frame = None
         self.svo2_depth_map = None
         self.svo2_bbox = None
+        self.svo2_bbox_right = None
         self.current_bbox = None
 
     def svo2_navigate(self, delta: int):
@@ -958,7 +963,14 @@ class EdgeDetectionGUI(QMainWindow):
         frame_bgra = left_mat.get_data()
         self.svo2_raw_frame = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
 
+        # Retrieve right camera image (BGRA → BGR)
+        right_mat = sl.Mat()
+        self.zed_camera.retrieve_image(right_mat, sl.VIEW.RIGHT)
+        right_bgra = right_mat.get_data()
+        self.svo2_right_frame = cv2.cvtColor(right_bgra, cv2.COLOR_BGRA2BGR)
+
         # Retrieve depth map (float32 metres; NaN / inf = invalid)
+        # Depth is aligned to the LEFT camera coordinate frame.
         if self.svo2_depth_mode != "NONE":
             depth_mat = sl.Mat()
             self.zed_camera.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
@@ -973,12 +985,14 @@ class EdgeDetectionGUI(QMainWindow):
 
         # Reset previous YOLO result when navigating
         self.svo2_bbox = None
+        self.svo2_bbox_right = None
         self.current_bbox = None
+        # _clean_image = left frame (algorithms always operate on left frame)
         self._clean_image = self.svo2_raw_frame.copy()
         self.current_image = self.svo2_raw_frame.copy()
 
-        # Show frame (no bbox yet)
-        self.display_image(self.svo2_raw_frame, draw_bbox=False)
+        # Show both cameras side by side (no bbox yet)
+        self.display_image(self._svo2_build_display_image(), draw_bbox=False)
         self.lbl_image_info.setText(
             f"SVO2: {self.svo2_file_path.name if self.svo2_file_path else '?'}  "
             f"— frame {self.svo2_current_frame + 1}/{self.svo2_total_frames}"
@@ -1024,49 +1038,34 @@ class EdgeDetectionGUI(QMainWindow):
         """Update YOLO inference size."""
         self.svo2_yolo_input_size = size
 
-    def run_yolo_svo2(self):
-        """Run YOLO inference on the current SVO2 frame."""
-        if self.svo2_raw_frame is None:
-            QMessageBox.information(self, "No Frame", "Navigate to a frame first.")
-            return
-        if not self._ensure_svo2_yolo_loaded():
-            return
-
-        t0 = time.perf_counter()
-
-        # Optional pre-downscale so the timing includes the resize cost
-        input_size = self.svo2_yolo_input_size
-        h, w = self.svo2_raw_frame.shape[:2]
+    def _yolo_detect_bbox(
+        self,
+        frame: np.ndarray,
+        input_size: int,
+    ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
+        """
+        Run YOLO on a single frame and return (bbox, elapsed_ms).
+        Timing includes the downscale step. Returns (None, ms) if no detection.
+        """
+        h, w = frame.shape[:2]
         if input_size < w:
             scale = input_size / w
             resized = cv2.resize(
-                self.svo2_raw_frame,
+                frame,
                 (input_size, int(h * scale)),
                 interpolation=cv2.INTER_LINEAR,
             )
         else:
-            resized = self.svo2_raw_frame
+            resized = frame
             scale = 1.0
 
-        try:
-            results = self.yolo_model(resized, imgsz=input_size, verbose=False)
-        except Exception as e:
-            QMessageBox.warning(self, "YOLO Error", str(e))
-            return
-
-        t1 = time.perf_counter()
-        elapsed_ms = (t1 - t0) * 1000.0
-        self.lbl_svo2_timing.setText(f"YOLO: {elapsed_ms:.1f} ms")
+        t0 = time.perf_counter()
+        results = self.yolo_model(resized, imgsz=input_size, verbose=False)
+        elapsed = (time.perf_counter() - t0) * 1000.0
 
         if not results or len(results[0].boxes) == 0:
-            QMessageBox.information(self, "No Detection",
-                                    "YOLO did not detect any object in this frame.")
-            self.svo2_bbox = None
-            self.current_bbox = None
-            self.display_image(self.svo2_raw_frame, draw_bbox=False)
-            return
+            return None, elapsed
 
-        # Pick highest-confidence detection; rescale bbox back to full resolution
         boxes = results[0].boxes
         best_idx = int(boxes.conf.argmax())
         xyxy = boxes.xyxy[best_idx].cpu().numpy()
@@ -1075,50 +1074,120 @@ class EdgeDetectionGUI(QMainWindow):
             x1, x2 = x1 / scale, x2 / scale
             y1, y2 = y1 / scale, y2 / scale
         x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+        x1 = max(0, min(w - 1, x1))
+        x2 = max(0, min(w - 1, x2))
+        y1 = max(0, min(h - 1, y1))
+        y2 = max(0, min(h - 1, y2))
+        return (x1, y1, x2, y2), elapsed
 
-        # Clamp to frame bounds
-        fh, fw = self.svo2_raw_frame.shape[:2]
-        x1 = max(0, min(fw - 1, x1))
-        x2 = max(0, min(fw - 1, x2))
-        y1 = max(0, min(fh - 1, y1))
-        y2 = max(0, min(fh - 1, y2))
+    def run_yolo_svo2(self):
+        """Run YOLO separately on the left and right SVO2 frames."""
+        if self.svo2_raw_frame is None:
+            QMessageBox.information(self, "No Frame", "Navigate to a frame first.")
+            return
+        if not self._ensure_svo2_yolo_loaded():
+            return
 
-        self.svo2_bbox = (x1, y1, x2, y2)
-        self.current_bbox = self.svo2_bbox
+        input_size = self.svo2_yolo_input_size
 
-        # Render and display
-        display = self._svo2_build_display_image()
-        self.display_image(display, draw_bbox=False)  # bbox already drawn in build_display
+        # ── Left frame ──────────────────────────────────────────────────────
+        try:
+            bbox_left, ms_left = self._yolo_detect_bbox(self.svo2_raw_frame, input_size)
+        except Exception as e:
+            QMessageBox.warning(self, "YOLO Error (left)", str(e))
+            return
 
-        # Enable edge detection and export buttons
+        # ── Right frame ─────────────────────────────────────────────────────
+        bbox_right, ms_right = None, 0.0
+        if self.svo2_right_frame is not None:
+            try:
+                bbox_right, ms_right = self._yolo_detect_bbox(self.svo2_right_frame, input_size)
+            except Exception as e:
+                print(f"[SVO2] YOLO right-frame error: {e}")
+
+        total_ms = ms_left + ms_right
+        det_left  = "✓" if bbox_left  is not None else "–"
+        det_right = "✓" if bbox_right is not None else "–"
+        self.lbl_svo2_timing.setText(
+            f"YOLO L{det_left} R{det_right}: {total_ms:.1f} ms"
+        )
+
+        if bbox_left is None and bbox_right is None:
+            QMessageBox.information(self, "No Detection",
+                                    "YOLO found no object in left or right frame.")
+            self.svo2_bbox = None
+            self.svo2_bbox_right = None
+            self.current_bbox = None
+            self.display_image(self._svo2_build_display_image(), draw_bbox=False)
+            return
+
+        self.svo2_bbox = bbox_left
+        self.svo2_bbox_right = bbox_right
+        self.current_bbox = self.svo2_bbox  # left bbox is the primary (for pose export)
+
+        self.display_image(self._svo2_build_display_image(), draw_bbox=False)
         self.btn_save.setEnabled(False)
         self.btn_export_pose.setEnabled(False)
 
     def _svo2_build_display_image(self) -> np.ndarray:
-        """Compose display image: left camera + depth overlay (if applicable)."""
+        """
+        Build the side-by-side display image:
+          LEFT panel  │  RIGHT panel
+        Both panels receive their independent YOLO bbox and depth overlay.
+        Depth is computed from the left stereo frame (ZED convention) and applied
+        to both panels at the same pixel coordinates – a small sub-pixel offset
+        on the right panel is acceptable at operational drone distances (> 2 m).
+        """
         if self.svo2_raw_frame is None:
-            return np.zeros((720, 1280, 3), dtype=np.uint8)
+            return np.zeros((720, 2560, 3), dtype=np.uint8)
 
-        display = self.svo2_raw_frame.copy()
+        left_panel  = self.svo2_raw_frame.copy()
+        right_panel = (
+            self.svo2_right_frame.copy()
+            if self.svo2_right_frame is not None
+            else np.zeros_like(left_panel)
+        )
 
-        # Draw YOLO bbox
+        # ── Left panel: YOLO bbox + depth overlay ───────────────────────────
         if self.svo2_bbox is not None:
             x1, y1, x2, y2 = self.svo2_bbox
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 165, 255), 2)
-            cv2.putText(display, "YOLO", (x1, max(15, y1 - 5)),
+            cv2.rectangle(left_panel, (x1, y1), (x2, y2), (0, 165, 255), 2)
+            cv2.putText(left_panel, "YOLO-L", (x1, max(15, y1 - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+            if self.svo2_show_depth_overlay and self.svo2_depth_map is not None:
+                left_panel = self._svo2_apply_depth_overlay(left_panel, self.svo2_bbox)
 
-        # Depth overlay inside bbox
-        if (self.svo2_show_depth_overlay
-                and self.svo2_bbox is not None
-                and self.svo2_depth_map is not None):
-            display = self._svo2_apply_depth_overlay(display)
+        # ── Right panel: YOLO bbox + depth overlay ──────────────────────────
+        if self.svo2_bbox_right is not None:
+            x1, y1, x2, y2 = self.svo2_bbox_right
+            cv2.rectangle(right_panel, (x1, y1), (x2, y2), (0, 210, 0), 2)
+            cv2.putText(right_panel, "YOLO-R", (x1, max(15, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 210, 0), 1)
+            if self.svo2_show_depth_overlay and self.svo2_depth_map is not None:
+                right_panel = self._svo2_apply_depth_overlay(right_panel, self.svo2_bbox_right)
 
-        return display
+        # ── Camera labels ────────────────────────────────────────────────────
+        cv2.putText(left_panel,  "LEFT",  (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(right_panel, "RIGHT", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
-    def _svo2_apply_depth_overlay(self, display: np.ndarray) -> np.ndarray:
-        """Overlay a TURBO colormap depth map inside the YOLO bbox."""
-        x1, y1, x2, y2 = self.svo2_bbox
+        return np.hstack([left_panel, right_panel])
+
+    def _svo2_apply_depth_overlay(
+        self,
+        panel: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        """
+        Overlay a TURBO colormap depth map inside *bbox* on *panel*.
+        panel  — single camera image (H×W×3 BGR), modified in-place copy.
+        bbox   — (x1,y1,x2,y2) in panel coordinates.
+        Depth map is always from the left camera; applying it to the right panel
+        introduces a small parallax offset that is visually acceptable at > 2 m.
+        """
+        x1, y1, x2, y2 = bbox
+        display = panel
         depth_crop = self.svo2_depth_map[y1:y2, x1:x2].copy()
 
         # Mask: only finite, positive depth values
@@ -1188,7 +1257,7 @@ class EdgeDetectionGUI(QMainWindow):
         """Update depth overlay opacity from slider."""
         self.svo2_depth_opacity = value / 100.0
         self.lbl_svo2_opacity.setText(f"{value}%")
-        if self.svo2_raw_frame is not None and self.svo2_bbox is not None:
+        if self.svo2_raw_frame is not None:
             self.display_image(self._svo2_build_display_image(), draw_bbox=False)
 
     # ------------------------------------------------------------------
@@ -1570,7 +1639,8 @@ class EdgeDetectionGUI(QMainWindow):
 
         pad = int(self.params.get('bbox_padding', 5))
         bx1, by1, bx2, by2 = self.current_bbox
-        h, w = self.current_image.shape[:2]
+        # Use _clean_image for bounds (in SVO2 mode current_image may be composite)
+        h, w = self._clean_image.shape[:2]
 
         # Expand by padding and clamp to image bounds
         x1 = max(0, bx1 - pad)
@@ -1632,41 +1702,95 @@ class EdgeDetectionGUI(QMainWindow):
         if self.current_image is None:
             QMessageBox.warning(self, "Warning", "No image loaded.")
             return
-        
+
         if self.current_bbox is None:
             QMessageBox.warning(self, "Warning", "No bounding box found for this image.")
             return
-        
+
         algo_name = self.combo_algorithm.currentText()
         algo_func = self.algorithms[algo_name]['func']
-        
-        # Measure edge detection runtime
+
+        # ── Left / single-frame run ──────────────────────────────────────────
         start_edge = time.perf_counter()
-        result = algo_func()
-        end_edge = time.perf_counter()
-        
-        self.edge_detection_time = (end_edge - start_edge) * 1000.0
-        self.last_runtime_ms = self.edge_detection_time
+        result_left = algo_func()   # operates on self._clean_image + self.current_bbox
+        t_left = time.perf_counter() - start_edge
+
+        # ── SVO2 mode: also run on right frame ───────────────────────────────
+        if self.current_mode == "svo" and self.svo2_right_frame is not None:
+            # Save left context
+            _clean_left = self._clean_image
+            _bbox_left  = self.current_bbox
+            fw_single   = _clean_left.shape[1]   # single-frame pixel width
+
+            # Switch to right frame context
+            self._clean_image = self.svo2_right_frame.copy()
+            self.current_bbox = self.svo2_bbox_right  # may be None → algo will warn
+
+            if self.current_bbox is not None:
+                t_right0 = time.perf_counter()
+                result_right = algo_func()
+                t_right = time.perf_counter() - t_right0
+            else:
+                result_right = self.svo2_right_frame.copy()
+                cv2.putText(result_right, "No YOLO bbox (right)", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 200), 2)
+                t_right = 0.0
+
+            # Restore left context
+            self._clean_image = _clean_left
+            self.current_bbox = _bbox_left
+
+            # Composite left | right
+            composite = np.hstack([result_left, result_right])
+
+            # Draw both YOLO bboxes on the composite (algorithms don't draw them)
+            if _bbox_left is not None:
+                bx1, by1, bx2, by2 = _bbox_left
+                cv2.rectangle(composite, (bx1, by1), (bx2, by2), (0, 165, 255), 2)
+            if self.svo2_bbox_right is not None:
+                bx1, by1, bx2, by2 = self.svo2_bbox_right
+                cv2.rectangle(composite,
+                              (bx1 + fw_single, by1),
+                              (bx2 + fw_single, by2),
+                              (0, 210, 0), 2)
+
+            # Camera labels on composite
+            cv2.putText(composite, "LEFT",  (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(composite, "RIGHT", (fw_single + 10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+            edge_total_ms = (t_left + t_right) * 1000.0
+            result = composite
+        else:
+            # Debug mode or no right frame
+            edge_total_ms = t_left * 1000.0
+            result = result_left
+
+        self.edge_detection_time = edge_total_ms
+        self.last_runtime_ms     = edge_total_ms
         fps = 1000.0 / self.last_runtime_ms if self.last_runtime_ms > 0 else 0
-        
+
         # Update timing display
         self.lbl_runtime.setText(f"Runtime: {self.last_runtime_ms:.2f} ms | FPS: {fps:.1f}")
-        
-        # Show detailed timing in SVO/SVO2 mode
         if self.current_mode == "svo":
-            yolo_ms = self.yolo_inference_time
-            total_time = yolo_ms + self.edge_detection_time
-            timing_text = (
-                f"YOLO: {yolo_ms:.2f} ms | "
-                f"Edge: {self.edge_detection_time:.2f} ms | "
-                f"Total: {total_time:.2f} ms"
+            self.lbl_detailed_timing.setText(
+                f"YOLO: {self.yolo_inference_time:.1f} ms | "
+                f"Edge L+R: {edge_total_ms:.1f} ms"
             )
-            self.lbl_detailed_timing.setText(timing_text)
 
         self.current_result = result
 
-        # Extract edge pixels by diffing result vs the frozen clean original
-        diff = np.abs(result.astype(np.int16) - self._clean_image.astype(np.int16))
+        # Extract edge pixels by diffing LEFT result vs frozen LEFT clean image
+        # (pose optimizer always uses the left camera frame)
+        if self.current_mode == "svo" and self.svo2_right_frame is not None:
+            left_only = result[:, :_clean_left.shape[1]]
+            ref_image = _clean_left
+        else:
+            left_only = result
+            ref_image = self._clean_image
+
+        diff = np.abs(left_only.astype(np.int16) - ref_image.astype(np.int16))
         changed = diff.max(axis=2) > 20
         rows_ch, cols_ch = np.where(changed)
         if len(rows_ch) > 0:
@@ -1675,8 +1799,9 @@ class EdgeDetectionGUI(QMainWindow):
             self.current_edge_pixels_abs = np.empty((0, 2), dtype=np.int32)
         self.btn_export_pose.setEnabled(len(self.current_edge_pixels_abs) > 10)
 
-        # Draw bbox AFTER algorithm processing
-        self.display_image(result, draw_bbox=True)
+        # Display result (bboxes already embedded for SVO2 composite)
+        draw_bb = (self.current_mode != "svo" or self.svo2_right_frame is None)
+        self.display_image(result, draw_bbox=draw_bb)
         self.btn_save.setEnabled(True)
     
     def apply_canny_auto(self) -> np.ndarray:
